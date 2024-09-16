@@ -4,7 +4,7 @@
 import {inject, injectable} from 'inversify';
 import {BigNumber, ethers} from 'ethers';
 import {DBConnection} from '../db/connection';
-import {KeyValuePairRepository, Transfer, TransferStatus} from '../db/models';
+import {KeyValuePairRepository, Transfer, TransferStatus, TransferBatchCommitment} from '../db/models';
 import {EthersProvider, FastBtcBridgeContract} from './base';
 import {Config} from '../config';
 import {Connection} from 'typeorm';
@@ -75,6 +75,7 @@ export class EventScanner {
             [
                 this.fastBtcBridge.filters.NewBitcoinTransfer(),
                 this.fastBtcBridge.filters.BitcoinTransferStatusUpdated(),
+                this.fastBtcBridge.filters.BitcoinTransferBatchSending(),
             ],
             fromBlock,
             toBlock,
@@ -83,6 +84,7 @@ export class EventScanner {
         return await this.dbConnection.transaction(async db => {
             const keyValuePairRepository = db.getCustomRepository(KeyValuePairRepository);
             const transferRepository = db.getRepository(Transfer);
+            const transferBatchCommitmentRepository = db.getRepository(TransferBatchCommitment);
 
             const transfers: Transfer[] = [];
             const transfersByTransferId: Record<string, Transfer> = {};
@@ -143,6 +145,56 @@ export class EventScanner {
                     }
 
                     transfer.status = newStatus;
+
+                    if (newStatus === TransferStatus.Sending) {
+                        // When we are updating to Sending, we should always see a BitcoinTransferBatchSending event
+                        // that contains args bitcoinTxHash and transferBatchSize, followed by transferBatchSize
+                        // BitcoinTransferStatusUpdated events with status Sending.
+                        // Thus, when we see a BitcoinTransferStatusUpdated event with status Sending,
+                        // we can query DB for the TransferBatchCommitment (BitcoinTransferBatchSending event)
+                        // where the logIndex and transferBatchSize match the current event, and use it to store
+                        // the bitcoin tx hash
+                        const commitment = await transferBatchCommitmentRepository
+                            .createQueryBuilder('c')
+                            .where({
+                                rskTransactionHash: event.transactionHash,
+                                rskTransactionIndex: event.transactionIndex,
+                            })
+                            .andWhere(
+                                'c.rsk_log_index < :logIndex AND :logIndex <= c.rsk_log_index + c.transfer_batch_size',
+                                {logIndex: event.logIndex}
+                            )
+                            .orderBy('c.rsk_log_index', 'DESC')
+                            .getOne();
+                        if (!commitment) {
+                            throw new Error(
+                                `Could not find TransferBatchCommitment for BitcoinTransferStatusUpdated event ` +
+                                `${event.transactionHash} ${event.transactionIndex} ${event.logIndex}
+                            `);
+                        }
+                        transfer.btcTransactionHash = commitment.btcTransactionHash;
+                    }
+                } else if (event.event === 'BitcoinTransferBatchSending') {
+                    let btcTransactionHash = args.bitcoinTxHash as string;
+                    // The BTC tx hashes we store don't generally start with 0x,
+                    // because BTC doesn't follow that convention. RSK does, however.
+                    if (btcTransactionHash.startsWith('0x')) {
+                        btcTransactionHash = btcTransactionHash.slice(2);
+                    }
+                    const transferBatchSize = args.transferBatchSize as number;
+                    this.logger.debug('BitcoinTransferBatchSending', btcTransactionHash, transferBatchSize);
+
+                    // could double-check it's not already in DB. But this would cause a db error anyway
+                    const commitment = transferBatchCommitmentRepository.create({
+                        btcTransactionHash: btcTransactionHash,
+                        transferBatchSize: transferBatchSize,
+                        rskTransactionHash: event.transactionHash,
+                        rskTransactionIndex: event.transactionIndex,
+                        rskLogIndex: event.logIndex,
+                        rskBlockNumber: event.blockNumber,
+                        rskBlockHash: event.blockHash,
+                    });
+                    await transferBatchCommitmentRepository.save(commitment);
                 } else {
                     this.logger.error('Unknown event:', event);
                 }
